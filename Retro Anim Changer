@@ -1,0 +1,432 @@
+--[[
+    Retro Anim Changer (EXPERIMENTAL)
+    By B00mz
+
+    Different method from the normal version:
+    instead of freezing your joints locally, this freezes your AnimationTracks
+    (speed 0) and manually jumps their TimePosition forward every `delay` seconds.
+    Because it changes the tracks themselves, it MIGHT replicate to other
+    players in some games. Results vary per game, so test with a friend/alt.
+
+    Notes:
+    - Turning the effect OFF (or setting delay to 0) gives every track its
+      normal speed back.
+    - One-shot animations (attacks, emotes) are released near their end so
+      they can finish normally instead of getting stuck.
+    - Running this replaces the normal version (and vice versa).
+]]
+
+local Players = game:GetService("Players")
+local RunService = game:GetService("RunService")
+local UserInputService = game:GetService("UserInputService")
+
+local LocalPlayer = Players.LocalPlayer
+
+-- Remove an older copy (normal or experimental) if already running
+local env = (getgenv and getgenv()) or _G
+if env.RetroAnimChangerCleanup then
+    pcall(env.RetroAnimChangerCleanup)
+end
+
+----------------------------------------------------------------------
+-- Settings / state
+----------------------------------------------------------------------
+local MIN_DELAY, MAX_DELAY = 0, 3
+local delay = 0.10          -- seconds each pose is held
+local enabled = true
+
+local connections = {}
+local gui
+
+local function connect(signal, fn)
+    local c = signal:Connect(fn)
+    table.insert(connections, c)
+    return c
+end
+
+----------------------------------------------------------------------
+-- Track-stepping core
+----------------------------------------------------------------------
+local orig = setmetatable({}, { __mode = "k" })      -- track -> speed the game wanted
+local released = setmetatable({}, { __mode = "k" })  -- one-shot tracks we let finish
+local animator
+local lastTick = os.clock()
+
+local function findAnimator()
+    local char = LocalPlayer.Character
+    if not char then
+        animator = nil
+        return
+    end
+    if animator and animator:IsDescendantOf(char) then
+        return
+    end
+    animator = char:FindFirstChildWhichIsA("Animator", true)
+end
+
+-- Gives every frozen track its normal speed back
+local function restoreAll()
+    if next(orig) ~= nil then
+        for track, speed in pairs(orig) do
+            pcall(function()
+                if track.Speed == 0 then
+                    track:AdjustSpeed(speed)
+                end
+            end)
+            orig[track] = nil
+        end
+    end
+    if next(released) ~= nil then
+        for track in pairs(released) do
+            released[track] = nil
+        end
+    end
+end
+
+local function step()
+    if not enabled or delay <= 0 then
+        restoreAll()
+        lastTick = os.clock()
+        return
+    end
+
+    findAnimator()
+    if not animator then return end
+
+    local ok, tracks = pcall(function()
+        return animator:GetPlayingAnimationTracks()
+    end)
+    if not ok then return end
+
+    -- Freeze every playing track (and catch speed changes made by the game)
+    local seen = {}
+    for _, track in ipairs(tracks) do
+        seen[track] = true
+        if not released[track] then
+            local s = track.Speed
+            if s ~= 0 then
+                orig[track] = s
+                track:AdjustSpeed(0)
+            end
+        end
+    end
+
+    -- Tracks that stopped: hand their speed back so replays behave normally
+    for track, speed in pairs(orig) do
+        if not seen[track] then
+            pcall(function()
+                if track.Speed == 0 then
+                    track:AdjustSpeed(speed)
+                end
+            end)
+            orig[track] = nil
+        end
+    end
+    for track in pairs(released) do
+        if not seen[track] then
+            released[track] = nil
+        end
+    end
+
+    -- Every `delay` seconds, jump the frozen tracks to the current time
+    local now = os.clock()
+    local elapsed = now - lastTick
+    if elapsed < delay then return end
+    lastTick = now
+
+    for track, speed in pairs(orig) do
+        local len = track.Length
+        if len > 0 and track.IsPlaying then
+            local t = track.TimePosition + elapsed * speed
+            if track.Looped then
+                track.TimePosition = t % len
+            elseif t >= len or t < 0 then
+                -- one-shot animation reached its end: let it finish normally
+                track.TimePosition = math.clamp(t, 0, len)
+                track:AdjustSpeed(speed)
+                orig[track] = nil
+                released[track] = true
+            else
+                track.TimePosition = t
+            end
+        end
+    end
+end
+
+connect(RunService.Heartbeat, step)
+
+----------------------------------------------------------------------
+-- GUI helpers
+----------------------------------------------------------------------
+local function new(class, props, parent)
+    local inst = Instance.new(class)
+    for k, v in pairs(props) do
+        inst[k] = v
+    end
+    inst.Parent = parent
+    return inst
+end
+
+local function corner(parent, radius)
+    return new("UICorner", { CornerRadius = UDim.new(0, radius) }, parent)
+end
+
+local function stroke(parent, color, thickness, transparency)
+    return new("UIStroke", {
+        Color = color,
+        Thickness = thickness,
+        Transparency = transparency,
+        ApplyStrokeMode = Enum.ApplyStrokeMode.Border,
+    }, parent)
+end
+
+-- Works with mouse and touch. If the pointer barely moves, it counts as a click.
+local function makeDraggable(handle, target, onClick)
+    local activeInput, dragStart, startPos, moved
+
+    handle.InputBegan:Connect(function(input)
+        if input.UserInputType == Enum.UserInputType.MouseButton1
+            or input.UserInputType == Enum.UserInputType.Touch then
+            activeInput = input
+            moved = false
+            dragStart = Vector2.new(input.Position.X, input.Position.Y)
+            startPos = target.AbsolutePosition
+            input.Changed:Connect(function()
+                if input.UserInputState == Enum.UserInputState.End and activeInput == input then
+                    activeInput = nil
+                    if not moved and onClick then
+                        onClick()
+                    end
+                end
+            end)
+        end
+    end)
+
+    connect(UserInputService.InputChanged, function(input)
+        if not activeInput then return end
+        local isMove
+        if activeInput.UserInputType == Enum.UserInputType.Touch then
+            isMove = (input == activeInput)
+        else
+            isMove = (input.UserInputType == Enum.UserInputType.MouseMovement)
+        end
+        if not isMove then return end
+
+        local delta = Vector2.new(input.Position.X, input.Position.Y) - dragStart
+        if delta.Magnitude > 6 then
+            moved = true
+        end
+        if moved then
+            local screen = gui.AbsoluteSize
+            local size = target.AbsoluteSize
+            local x = math.clamp(startPos.X + delta.X, 0, math.max(0, screen.X - size.X))
+            local y = math.clamp(startPos.Y + delta.Y, 0, math.max(0, screen.Y - size.Y))
+            target.Position = UDim2.fromOffset(x, y)
+        end
+    end)
+end
+
+local function mountGui(g)
+    local ok = pcall(function()
+        g.Parent = (gethui and gethui()) or game:GetService("CoreGui")
+    end)
+    if not ok or not g.Parent then
+        g.Parent = LocalPlayer:WaitForChild("PlayerGui")
+    end
+end
+
+----------------------------------------------------------------------
+-- GUI
+----------------------------------------------------------------------
+gui = Instance.new("ScreenGui")
+gui.Name = "RetroAnimChanger"
+gui.ResetOnSpawn = false
+gui.IgnoreGuiInset = true
+gui.DisplayOrder = 999
+gui.ZIndexBehavior = Enum.ZIndexBehavior.Sibling
+mountGui(gui)
+
+local WHITE = Color3.fromRGB(255, 255, 255)
+local MINT = Color3.fromRGB(130, 255, 190)
+local GRAY = Color3.fromRGB(170, 170, 190)
+local PANEL = Color3.fromRGB(22, 22, 30)
+local FIELD = Color3.fromRGB(38, 38, 52)
+
+-- Menu ---------------------------------------------------------------
+local menu = new("Frame", {
+    Name = "Menu",
+    Size = UDim2.fromOffset(250, 205),
+    Position = UDim2.new(0.5, -125, 0.5, -102),
+    BackgroundColor3 = PANEL,
+    BorderSizePixel = 0,
+    Active = true,
+    Visible = false,
+}, gui)
+corner(menu, 12)
+stroke(menu, MINT, 1.5, 0.5)
+
+local header = new("Frame", {
+    Name = "Header",
+    Size = UDim2.new(1, 0, 0, 58),
+    BackgroundTransparency = 1,
+}, menu)
+
+new("TextLabel", {
+    Name = "Title",
+    Position = UDim2.new(0, 0, 0, 8),
+    Size = UDim2.new(1, 0, 0, 26),
+    BackgroundTransparency = 1,
+    Text = "Retro Anim Changer",
+    Font = Enum.Font.Arcade,
+    TextSize = 20,
+    TextColor3 = MINT,
+}, header)
+
+new("TextLabel", {
+    Name = "Credit",
+    Position = UDim2.new(0, 0, 0, 34),
+    Size = UDim2.new(1, 0, 0, 16),
+    BackgroundTransparency = 1,
+    Text = "By B00mz",
+    Font = Enum.Font.GothamMedium,
+    TextSize = 13,
+    TextColor3 = GRAY,
+}, header)
+
+new("Frame", {
+    Position = UDim2.new(0, 12, 0, 58),
+    Size = UDim2.new(1, -24, 0, 1),
+    BackgroundColor3 = MINT,
+    BackgroundTransparency = 0.75,
+    BorderSizePixel = 0,
+}, menu)
+
+new("TextLabel", {
+    Position = UDim2.new(0, 16, 0, 68),
+    Size = UDim2.new(1, -32, 0, 18),
+    BackgroundTransparency = 1,
+    Text = "Delay (seconds)",
+    Font = Enum.Font.GothamMedium,
+    TextSize = 13,
+    TextColor3 = WHITE,
+    TextXAlignment = Enum.TextXAlignment.Left,
+}, menu)
+
+local function makeSmallButton(text, position)
+    local b = new("TextButton", {
+        Position = position,
+        Size = UDim2.fromOffset(40, 36),
+        BackgroundColor3 = FIELD,
+        Text = text,
+        Font = Enum.Font.GothamBold,
+        TextSize = 20,
+        TextColor3 = WHITE,
+        AutoButtonColor = true,
+    }, menu)
+    corner(b, 8)
+    return b
+end
+
+local minusBtn = makeSmallButton("-", UDim2.new(0, 16, 0, 92))
+local plusBtn = makeSmallButton("+", UDim2.new(1, -56, 0, 92))
+
+local box = new("TextBox", {
+    Name = "DelayBox",
+    Position = UDim2.new(0, 62, 0, 92),
+    Size = UDim2.new(1, -124, 0, 36),
+    BackgroundColor3 = FIELD,
+    Text = string.format("%.2f", delay),
+    PlaceholderText = "0.10",
+    ClearTextOnFocus = false,
+    Font = Enum.Font.GothamBold,
+    TextSize = 16,
+    TextColor3 = WHITE,
+}, menu)
+corner(box, 8)
+
+new("TextLabel", {
+    Position = UDim2.new(0, 16, 0, 134),
+    Size = UDim2.new(1, -32, 0, 16),
+    BackgroundTransparency = 1,
+    Text = "Higher = choppier  |  0 = smooth",
+    Font = Enum.Font.Gotham,
+    TextSize = 12,
+    TextColor3 = GRAY,
+}, menu)
+
+local toggle = new("TextButton", {
+    Position = UDim2.new(0, 16, 0, 158),
+    Size = UDim2.new(1, -32, 0, 34),
+    BackgroundColor3 = Color3.fromRGB(40, 120, 80),
+    Text = "Effect: ON",
+    Font = Enum.Font.GothamBold,
+    TextSize = 15,
+    TextColor3 = WHITE,
+    AutoButtonColor = true,
+}, menu)
+corner(toggle, 8)
+
+-- Delay logic --------------------------------------------------------
+local function setDelay(v)
+    v = math.clamp(v, MIN_DELAY, MAX_DELAY)
+    v = math.floor(v * 100 + 0.5) / 100
+    delay = v
+    box.Text = string.format("%.2f", v)
+end
+
+box.FocusLost:Connect(function()
+    local n = tonumber(box.Text)
+    setDelay(n or delay)
+end)
+
+minusBtn.Activated:Connect(function() setDelay(delay - 0.05) end)
+plusBtn.Activated:Connect(function() setDelay(delay + 0.05) end)
+
+toggle.Activated:Connect(function()
+    enabled = not enabled
+    if enabled then
+        toggle.Text = "Effect: ON"
+        toggle.BackgroundColor3 = Color3.fromRGB(40, 120, 80)
+    else
+        toggle.Text = "Effect: OFF"
+        toggle.BackgroundColor3 = Color3.fromRGB(140, 50, 50)
+    end
+end)
+
+-- Draggable 75% transparent button ------------------------------------
+local openBtn = new("TextButton", {
+    Name = "OpenButton",
+    Size = UDim2.fromOffset(52, 52),
+    Position = UDim2.new(0, 20, 0.5, -26),
+    BackgroundColor3 = Color3.fromRGB(20, 20, 28),
+    BackgroundTransparency = 0.75,
+    Text = "RA",
+    Font = Enum.Font.Arcade,
+    TextSize = 22,
+    TextColor3 = WHITE,
+    TextTransparency = 0.2,
+    AutoButtonColor = false,
+}, gui)
+corner(openBtn, 12)
+stroke(openBtn, MINT, 1.5, 0.6)
+
+makeDraggable(openBtn, openBtn, function()
+    menu.Visible = not menu.Visible
+end)
+makeDraggable(header, menu) -- drag the menu by its title
+
+----------------------------------------------------------------------
+-- Cleanup (used when the script is re-executed)
+----------------------------------------------------------------------
+env.RetroAnimChangerCleanup = function()
+    restoreAll() -- give frozen tracks their speed back
+    for _, c in ipairs(connections) do
+        pcall(function() c:Disconnect() end)
+    end
+    if gui then
+        gui:Destroy()
+    end
+    env.RetroAnimChangerCleanup = nil
+end
+
+print("[Retro Anim Changer - Experimental] loaded - by B00mz")
